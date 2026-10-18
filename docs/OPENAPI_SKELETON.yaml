@@ -1,0 +1,328 @@
+openapi: 3.0.3
+info:
+  title: PacketLens API
+  version: 1.0.0
+  description: >
+    Automated deep analysis of pcap/pcapng captures for network and application
+    performance troubleshooting. All endpoints are tenant-scoped; requests require
+    a Bearer JWT or `X-API-Key` header.
+servers:
+  - url: https://api.packetlens.internal/v1
+security:
+  - bearerAuth: []
+  - apiKey: []
+tags:
+  - name: captures
+  - name: analysis
+  - name: decryption
+  - name: reports
+  - name: jobs
+paths:
+  /captures/uploads:
+    post:
+      tags: [captures]
+      summary: Create a resumable upload session
+      operationId: createUpload
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/UploadRequest'}
+      responses:
+        '201':
+          description: Upload session created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/UploadSession'}
+        '409':
+          description: Duplicate capture (same sha256 already exists)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DuplicateCapture'}
+  /captures/{capture_id}/chunks/{chunk_number}:
+    put:
+      tags: [captures]
+      summary: Upload one chunk (idempotent by chunk_number)
+      operationId: putChunk
+      parameters:
+        - {name: capture_id, in: path, required: true, schema: {type: string, format: uuid}}
+        - {name: chunk_number, in: path, required: true, schema: {type: integer}}
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: {type: string, format: binary}
+      responses:
+        '200': {description: Chunk stored}
+        '413': {description: Chunk too large}
+  /captures/{capture_id}/complete:
+    post:
+      tags: [captures]
+      summary: Finalize upload, verify SHA-256, enqueue analysis job
+      operationId: completeUpload
+      parameters:
+        - {name: capture_id, in: path, required: true, schema: {type: string, format: uuid}}
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                sha256: {type: string, description: Client-computed hash for verification}
+                auto_analyze: {type: boolean, default: true}
+                profile: {type: string, default: datacenter}
+      responses:
+        '202':
+          description: Capture accepted; analysis job queued
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CaptureStatus'}
+  /captures/{capture_id}:
+    get:
+      tags: [captures]
+      operationId: getCapture
+      parameters: [{name: capture_id, in: path, required: true, schema: {type: string, format: uuid}}]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Capture'}
+    delete:
+      tags: [captures]
+      summary: Secure-delete capture and all derived artifacts
+      parameters: [{name: capture_id, in: path, required: true, schema: {type: string, format: uuid}}]
+      responses: {'204': {description: Deleted}}
+  /captures/{capture_id}/status:
+    get:
+      tags: [captures]
+      operationId: getCaptureStatus
+      parameters: [{name: capture_id, in: path, required: true, schema: {type: string, format: uuid}}]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CaptureStatus'}
+  /captures/{capture_id}/analyze:
+    post:
+      tags: [analysis]
+      summary: Enqueue (or re-enqueue/resume) the analysis pipeline
+      parameters:
+        - {name: capture_id, in: path, required: true, schema: {type: string, format: uuid}}
+        - {name: profile, in: query, schema: {type: string, default: datacenter}}
+      responses:
+        '202':
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Job'}
+  /captures/{capture_id}/analysis:
+    get:
+      tags: [analysis]
+      summary: Get analysis.json
+      parameters: [{name: capture_id, in: path, required: true, schema: {type: string, format: uuid}}]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {type: object, description: AnalysisResult per docs/DATA_MODEL.md}
+  /captures/{capture_id}/findings:
+    get:
+      tags: [analysis]
+      parameters:
+        - {name: capture_id, in: path, required: true, schema: {type: string, format: uuid}}
+        - {name: severity, in: query, schema: {type: string, enum: [info, low, medium, high, critical]}}
+        - {name: category, in: query, schema: {type: string}}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/Finding'}
+  /captures/{capture_id}/streams:
+    get:
+      tags: [analysis]
+      parameters:
+        - {name: capture_id, in: path, required: true, schema: {type: string, format: uuid}}
+        - {name: sort, in: query, schema: {type: string, default: anomaly_score}}
+        - {name: page, in: query, schema: {type: integer, default: 1}}
+        - {name: page_size, in: query, schema: {type: integer, default: 100, maximum: 1000}}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total: {type: integer}
+                  items: {type: array, items: {$ref: '#/components/schemas/StreamSummary'}}
+  /captures/{capture_id}/streams/{stream_id}:
+    get:
+      tags: [analysis]
+      summary: Stream detail with paginated packet view (never full packet list)
+      parameters:
+        - {name: capture_id, in: path, required: true, schema: {type: string, format: uuid}}
+        - {name: stream_id, in: path, required: true, schema: {type: integer}}
+        - {name: after_frame, in: query, schema: {type: integer}}
+        - {name: limit, in: query, schema: {type: integer, default: 500, maximum: 5000}}
+        - {name: redact_payloads, in: query, schema: {type: boolean, default: true}}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/StreamDetail'}
+  /captures/{capture_id}/streams/{stream_id}/deep-analysis:
+    post:
+      tags: [analysis]
+      summary: Lazy TShark deep dissection of one stream (cached)
+      parameters:
+        - {name: capture_id, in: path, required: true, schema: {type: string, format: uuid}}
+        - {name: stream_id, in: path, required: true, schema: {type: integer}}
+      responses:
+        '202':
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Job'}
+  /captures/{capture_id}/keys:
+    post:
+      tags: [decryption]
+      summary: Upload SSLKEYLOGFILE / TLS keys (encrypted at rest, never logged)
+      parameters: [{name: capture_id, in: path, required: true, schema: {type: string, format: uuid}}]
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                keyfile: {type: string, format: binary}
+      responses: {'201': {description: Stored}}
+    delete:
+      tags: [decryption]
+      parameters: [{name: capture_id, in: path, required: true, schema: {type: string, format: uuid}}]
+      responses: {'204': {description: Key material purged}}
+  /captures/{capture_id}/report:
+    get:
+      tags: [reports]
+      summary: HTML report
+      parameters: [{name: capture_id, in: path, required: true, schema: {type: string, format: uuid}}]
+      responses:
+        '200': {content: {text/html: {schema: {type: string}}}}
+  /captures/{capture_id}/report.pdf:
+    get:
+      tags: [reports]
+      parameters: [{name: capture_id, in: path, required: true, schema: {type: string, format: uuid}}]
+      responses:
+        '200': {content: {application/pdf: {schema: {type: string, format: binary}}}}
+  /captures/{capture_id}/report.docx:
+    get:
+      tags: [reports]
+      parameters: [{name: capture_id, in: path, required: true, schema: {type: string, format: uuid}}]
+      responses:
+        '200': {content: {application/vnd.openxmlformats-officedocument.wordprocessingml.document: {schema: {type: string, format: binary}}}}
+  /captures/{capture_id}/report/regenerate:
+    post:
+      tags: [reports]
+      parameters: [{name: capture_id, in: path, required: true, schema: {type: string, format: uuid}}]
+      responses: {'202': {content: {application/json: {schema: {$ref: '#/components/schemas/Job'}}}}}
+  /jobs/{job_id}:
+    get:
+      tags: [jobs]
+      parameters: [{name: job_id, in: path, required: true, schema: {type: string, format: uuid}}]
+      responses:
+        '200': {content: {application/json: {schema: {$ref: '#/components/schemas/Job'}}}}
+  /jobs/{job_id}/events:
+    get:
+      tags: [jobs]
+      summary: SSE stream of job progress events
+      parameters: [{name: job_id, in: path, required: true, schema: {type: string, format: uuid}}]
+      responses:
+        '200': {content: {'text/event-stream': {schema: {type: string}}}}
+components:
+  securitySchemes:
+    bearerAuth: {type: http, scheme: bearer, bearerFormat: JWT}
+    apiKey: {type: apiKey, in: header, name: X-API-Key}
+  schemas:
+    UploadRequest:
+      type: object
+      required: [filename, size_bytes]
+      properties:
+        filename: {type: string}
+        size_bytes: {type: integer, format: int64}
+        sha256: {type: string, description: Optional precomputed hash for dedupe}
+        chunk_size: {type: integer, default: 8388608}
+    UploadSession:
+      type: object
+      properties:
+        capture_id: {type: string, format: uuid}
+        chunk_size: {type: integer}
+        uploaded_chunks: {type: array, items: {type: integer}}
+    DuplicateCapture:
+      type: object
+      properties:
+        existing_capture_id: {type: string, format: uuid}
+        message: {type: string}
+    Capture:
+      type: object
+      properties:
+        capture_id: {type: string, format: uuid}
+        tenant_id: {type: string}
+        filename: {type: string}
+        sha256: {type: string}
+        size_bytes: {type: integer, format: int64}
+        format: {type: string, enum: [pcap, pcapng]}
+        status: {type: string}
+        created_at: {type: string, format: date-time}
+        packet_count: {type: integer}
+        duration_seconds: {type: number}
+        drop_count: {type: integer}
+    CaptureStatus:
+      type: object
+      properties:
+        capture_id: {type: string, format: uuid}
+        status: {type: string, enum: [uploading, uploaded, validating, indexing, summarizing, analyzing, deep-analyzing, reporting, done, failed]}
+        stage_progress: {type: number}
+        job: {$ref: '#/components/schemas/Job'}
+    Job:
+      type: object
+      properties:
+        job_id: {type: string, format: uuid}
+        type: {type: string}
+        status: {type: string, enum: [queued, running, succeeded, failed, cancelled]}
+        current_stage: {type: string}
+        attempts: {type: integer}
+        error: {type: string, nullable: true}
+    Finding:
+      type: object
+      properties:
+        finding_id: {type: string}
+        severity: {type: string, enum: [info, low, medium, high, critical]}
+        confidence: {type: string, enum: [low, medium, high]}
+        category: {type: string}
+        title: {type: string}
+        description: {type: string}
+        affected_hosts: {type: array, items: {type: string}}
+        affected_streams: {type: array, items: {type: integer}}
+        evidence: {type: object}
+        recommendation: {type: string}
+        chart: {type: string, nullable: true}
+    StreamSummary:
+      type: object
+      properties:
+        stream_id: {type: integer}
+        stream_type: {type: string}
+        client_endpoint: {type: string}
+        server_endpoint: {type: string}
+        packet_count: {type: integer}
+        retransmission_ratio: {type: number}
+        avg_rtt_ms: {type: number}
+        zero_window_count: {type: integer}
+        rst_count: {type: integer}
+        throughput_bps: {type: number}
+        application_protocol_guess: {type: string}
+        anomaly_score: {type: number}
+    StreamDetail:
+      type: object
+      properties:
+        summary: {$ref: '#/components/schemas/StreamSummary'}
+        packets: {type: array, items: {type: object}, description: One page of packet metadata}
+        next_page_after_frame: {type: integer, nullable: true}
+        markers: {type: array, items: {type: object}}
