@@ -1,0 +1,43 @@
+[package]
+name = "packetlens-core"
+version = "0.1.0"
+edition = "2021"
+description = "Streaming pcap/pcapng packet indexer with bounded memory and checkpoint/resume"
+license = "Apache-2.0"
+
+[lib]
+name = "packetlens_core"
+crate-type = ["cdylib", "rlib"]   # cdylib for PyO3 wheel, rlib for the CLI binary
+
+[[bin]]
+name = "packetlens-indexer"
+path = "src/bin/indexer.rs"
+
+[features]
+default = []
+python = ["pyo3"]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+arrow = { version = "53", features = ["ipc"] }
+parquet = { version = "53", features = ["zstd"] }
+object_store = { version = "0.11", features = ["aws"] }   # S3/MinIO ranged reads
+futures = "0.3"
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+ipnetwork = "0.20"
+
+pyo3 = { version = "0.22", optional = true, features = ["extension-module"] }
+
+[dev-dependencies]
+tempfile = "3"
+tracing-subscriber = "0.3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
